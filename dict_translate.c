@@ -22,14 +22,14 @@ PG_MODULE_MAGIC;
 
 typedef struct
 {
-	char	   *in;
-	char	   *out;
-	int			outlen;
+	char	   *key;			/* Word */
+	char	   *value;			/* Unparsed list of synonyms, including the
+								 * word itself */
 } TranslateEntry;
 
 typedef struct
 {
-	int			len;			/* length of trn array */
+	size_t			len;			/* length of trn array */
 	TranslateEntry *trn;
 
 	/* subdictionary to normalize input lexeme */
@@ -40,30 +40,19 @@ typedef struct
 PG_FUNCTION_INFO_V1(dtrn_init);
 PG_FUNCTION_INFO_V1(dtrn_lexize);
 
-/*
- * Finds the next whitespace-delimited word within the 'in' string.
- * Returns a pointer to the first character of the word, and a pointer
- * to the next byte after the last character in the word (in *end).
- */
 static char *
-findwrd(char *in, char **end)
+find_word(char *in, char **end)
 {
 	char	   *start;
 
-	/* Skip leading spaces */
+	*end = NULL;
 	while (*in && t_isspace(in))
 		in += pg_mblen(in);
 
-	/* Return NULL on empty lines */
-	if (*in == '\0')
-	{
-		*end = NULL;
+	if (!*in || *in == '#')
 		return NULL;
-	}
-
 	start = in;
 
-	/* Find end of word */
 	while (*in && !t_isspace(in))
 		in += pg_mblen(in);
 
@@ -75,86 +64,88 @@ findwrd(char *in, char **end)
 static int
 compareTrn(const void *a, const void *b)
 {
-	return strcmp(((const TranslateEntry *) a)->in,
-				  ((const TranslateEntry *) b)->in);
+	return strcmp(((const TranslateEntry *) a)->key,
+				  ((const TranslateEntry *) b)->key);
 }
 
 static void
 read_dictionary(char *filename, DictTranslate *d)
 {
+	char	   *real_filename = get_tsearch_config_filename(filename, "trn");
 	tsearch_readline_state trst;
 	char	   *line = NULL;
-	char	   *starti,
-			   *starto,
-			   *end = NULL;
-	int			cur = 0;
+	size_t		cur = 0;
 
-	filename = get_tsearch_config_filename(filename, "trn");
-
-	if (!tsearch_readline_begin(&trst, filename))
+	if (!tsearch_readline_begin(&trst, real_filename))
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("could not open translate file \"%s\": %m",
-						filename)));
+						real_filename)));
 
 	while ((line = tsearch_readline(&trst)) != NULL)
 	{
-		starti = findwrd(line, &end);
-		if (!starti)
+		char	   *lower_line,
+				   *key,
+				   *value,
+				   *end;
+
+		if (*line == '\0')
+			continue;
+
+		lower_line = lowerstr(line);
+		pfree(line);
+
+		key = find_word(lower_line, &end);
+		if (!key)
 		{
 			/* Empty line */
 			goto skipline;
 		}
+
 		if (*end == '\0')
 		{
 			/* A line with only one word. Ignore silently. */
 			goto skipline;
 		}
-		*end = '\0';
 
-		starto = findwrd(end + 1, &end);
-		if (!starto)
+		/* Find start position of the key translation */
+		value = end;
+		while (*value && t_isspace(value))
+			value += pg_mblen(value);
+
+		if (!value)
 		{
 			/* A line with only one word (+whitespace). Ignore silently. */
 			goto skipline;
 		}
-		*end = '\0';
 
-		/*
-		 * starti now points to the first word, and starto to the second word
-		 * on the line, with a \0 terminator at the end of both words.
-		 */
-
-		if (cur >= d->len)
+		/* Enlarge trn structure if full */
+		if (cur == d->len)
 		{
-			if (d->len == 0)
-			{
-				d->len = 64;
-				d->trn = (TranslateEntry *) palloc(sizeof(TranslateEntry) * d->len);
-			}
-			else
-			{
-				d->len *= 2;
+			d->len = (d->len > 0) ? 2 * d->len : 16;
+			if (d->trn)
 				d->trn = (TranslateEntry *) repalloc(d->trn,
 													 sizeof(TranslateEntry) * d->len);
-			}
+			else
+				d->trn = (TranslateEntry *) palloc(sizeof(TranslateEntry) * d->len);
 		}
 
-		d->trn[cur].in = lowerstr(starti);
-		d->trn[cur].out = lowerstr(starto);
-
-		d->trn[cur].outlen = strlen(starto);
+		d->trn[cur].key = pnstrdup(key, end - key);
+		d->trn[cur].value = pstrdup(value);
 
 		cur++;
 
 skipline:
-		pfree(line);
+		pfree(lower_line);
 	}
 
 	tsearch_readline_end(&trst);
 
 	d->len = cur;
-	qsort(d->trn, d->len, sizeof(TranslateEntry), compareTrn);
+	if (cur > 1)
+		qsort(d->trn, d->len, sizeof(TranslateEntry), compareTrn);
+
+	pfree(real_filename);
 }
 
 Datum
@@ -218,11 +209,16 @@ dtrn_lexize(PG_FUNCTION_ARGS)
 	char	   *in = (char *) PG_GETARG_POINTER(1);
 	int32		len = PG_GETARG_INT32(2);
 	TSLexeme   *res = NULL,
-			   *ptr_cur,
-			   *ptr_res;
-	TranslateEntry key,
+			   *input_res,
+			   *input_ptr;
+	TranslateEntry word,
 			   *found;
-	int32		nvariant = 1;
+	uint16		nvariant = 1;
+	Size		cur = 0,
+				lres = 0;
+	char	   *translate,
+			   *pos,
+			   *end;
 
 	/* note: d->len test protects against Solaris bsearch-of-no-items bug */
 	if (len <= 0 || d->len <= 0)
@@ -231,42 +227,67 @@ dtrn_lexize(PG_FUNCTION_ARGS)
 	if (!d->inDict->isvalid)
 		d->inDict = lookup_ts_dictionary_cache(d->inDictOid);
 
-	res = (TSLexeme *) DatumGetPointer(FunctionCall4(&(d->inDict->lexize),
+	input_res = (TSLexeme *) DatumGetPointer(FunctionCall4(&(d->inDict->lexize),
 									   PointerGetDatum(d->inDict->dictData),
 													 PointerGetDatum(in),
 													 Int32GetDatum(len),
 													 PointerGetDatum(NULL)));
 
-	if (!res || !res->lexeme)
+	if (!input_res)
 		PG_RETURN_POINTER(NULL);
 
-	ptr_res = ptr_cur = res;
-	while (ptr_cur->lexeme)
+	if (!input_res->lexeme)
 	{
-		key.in = lowerstr_with_len(ptr_cur->lexeme, strlen(ptr_cur->lexeme));
-		key.out = NULL;
+		pfree(input_res);
+		PG_RETURN_POINTER(NULL);
+	}
 
-		found = (TranslateEntry *) bsearch(&key, d->trn, d->len,
+	input_ptr = input_res;
+	while (input_ptr->lexeme)
+	{
+		word.key = lowerstr(input_ptr->lexeme);
+		word.value = NULL;
+		pfree(input_ptr->lexeme);
+
+		found = (TranslateEntry *) bsearch(&word, d->trn, d->len,
 										   sizeof(TranslateEntry), compareTrn);
-		pfree(ptr_cur->lexeme);
-		pfree(key.in);
+		pfree(word.key);
 
 		if (found)
 		{
-			ptr_res->nvariant = nvariant;
-			ptr_res->lexeme = pnstrdup(found->out, found->outlen);
-			ptr_res->flags = 0;
+			pos = found->value;
+			while ((translate = find_word(pos, &end)) != NULL)
+			{
+				if (cur == 0 || cur == lres - 1 /* for res[cur].lexeme = NULL */)
+				{
+					lres = (lres > 0) ? 2 * lres : 8;
+					if (res)
+						res = (TSLexeme *) repalloc(res, sizeof(TSLexeme) * lres);
+					else
+						res = (TSLexeme *) palloc(sizeof(TSLexeme) * lres);
+				}
 
-			ptr_res++;
-			nvariant++;
+				res[cur].nvariant = nvariant;
+				res[cur].lexeme = pnstrdup(translate, end - translate);
+				res[cur].flags = 0;
+
+				cur++;
+				nvariant++;
+
+				pos = end;
+			}
 		}
 		/*
 		 * Compound words do not supported yet.
 		 * So iterate without considering them.
 		 */
-		ptr_cur++;
+		input_ptr++;
 	}
-	ptr_res->lexeme = NULL;
+
+	pfree(input_res);
+
+	if (res)
+		res[cur].lexeme = NULL;
 
 	PG_RETURN_POINTER(res);
 }
