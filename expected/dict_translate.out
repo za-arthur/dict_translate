@@ -1,0 +1,35 @@
+CREATE EXTENSION dict_translate;
+CREATE TEXT SEARCH DICTIONARY test_trn (
+		Template = translate,
+		DictFile = translate_sample,
+		InputDict = english_stem);
+SELECT ts_lexize('test_trn', 'forest');
+     ts_lexize     
+-------------------
+ {wald,forst,holz}
+(1 row)
+
+SELECT ts_lexize('test_trn', 'forests');
+     ts_lexize     
+-------------------
+ {wald,forst,holz}
+(1 row)
+
+SELECT ts_lexize('test_trn', 'home');
+  ts_lexize  
+-------------
+ {haus,heim}
+(1 row)
+
+SELECT ts_lexize('test_trn', 'homeless');
+ ts_lexize 
+-----------
+ 
+(1 row)
+
+SELECT ts_lexize('test_trn', 'haus');
+ ts_lexize 
+-----------
+ 
+(1 row)
+

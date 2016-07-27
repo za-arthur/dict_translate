@@ -17,3 +17,5 @@ CREATE TEXT SEARCH TEMPLATE translate (
 		LEXIZE = dtrn_lexize,
 		INIT   = dtrn_init
 );
+
+COMMENT ON TEXT SEARCH TEMPLATE translate IS 'Dictionary template for translation';
