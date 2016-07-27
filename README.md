@@ -26,14 +26,14 @@ Create the file $SHAREDIR/tsearch_data/test_trn.trn:
 Create text search dictionary and configuration:
 
 ```sql
-=# CREATE TEXT SEARCH DICTIONARY test_trn (
+=> CREATE TEXT SEARCH DICTIONARY test_trn (
  Template = translate,
  DictFile = test_trn,
  InputDict = pg_catalog.english_stem);
 
-=# CREATE TEXT SEARCH CONFIGURATION test_cfg(COPY='simple');
+=> CREATE TEXT SEARCH CONFIGURATION test_cfg(COPY='simple');
 
-=# ALTER TEXT SEARCH CONFIGURATION test_cfg
+=> ALTER TEXT SEARCH CONFIGURATION test_cfg
  ALTER MAPPING FOR asciiword, asciihword, hword_asciipart,
    word, hword, hword_part
  WITH test_trn, english_stem;
@@ -42,21 +42,21 @@ Create text search dictionary and configuration:
 You can test this dictionary using this table:
 
 ```sql
-=# CREATE TABLE test (t text);
+=> CREATE TABLE test (t text);
 
-=# INSERT INTO test VALUES ('homes'), ('home'), ('forest'), ('haus');
+=> INSERT INTO test VALUES ('homes'), ('home'), ('forest'), ('haus');
 ```
 
 Query examples:
 
 ```sql
-=# SELECT * FROM test WHERE to_tsvector('test_cfg', t) @@ to_tsquery('test_cfg', 'forests');
+=> SELECT * FROM test WHERE to_tsvector('test_cfg', t) @@ to_tsquery('test_cfg', 'forests');
    t    
 --------
 forest
 (1 row)
 
-=# SELECT * FROM test WHERE to_tsvector('test_cfg', t) @@ to_tsquery('test_cfg', 'home');
+=> SELECT * FROM test WHERE to_tsvector('test_cfg', t) @@ to_tsquery('test_cfg', 'home');
    t   
 -------
  homes
